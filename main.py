@@ -1,4 +1,5 @@
 '''Train CIFAR10 with PyTorch.'''
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,148 +8,171 @@ import torch.backends.cudnn as cudnn
 
 import torchvision
 import torchvision.transforms as transforms
-
+from torchsummary import summary
 import os
 import argparse
+from tqdm import tqdm
+import utils
+from utils import *
+import resnet
+from resnet import ResNet18
 
-from models import *
-from utils import progress_bar
-
-
-parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
-parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-parser.add_argument('--resume', '-r', action='store_true',
-                    help='resume from checkpoint')
-args = parser.parse_args()
-
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-best_acc = 0  # best test accuracy
-start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 
 # Data
-print('==> Preparing data..')
-transform_train = transforms.Compose([
-    transforms.RandomCrop(32, padding=4),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
+def prep_data(p_batchsize = 64, p_download_required = 'Y'
+                           ,p_orig_train_dataset = None
+                           ,p_orig_test_dataset = None):
+  cuda = torch.cuda.is_available()
+  if (p_download_required == 'Y'):
+    print('==> Downloading data..')
+    train_transform = transforms.Compose([transforms.ToTensor()])
 
-transform_test = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
+    test_transform = transforms.Compose(
+        [transforms.ToTensor()])
 
-trainset = torchvision.datasets.CIFAR10(
-    root='./data', train=True, download=True, transform=transform_train)
-trainloader = torch.utils.data.DataLoader(
-    trainset, batch_size=128, shuffle=True, num_workers=2)
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                            download=True, transform=train_transform)
 
-testset = torchvision.datasets.CIFAR10(
-    root='./data', train=False, download=True, transform=transform_test)
-testloader = torch.utils.data.DataLoader(
-    testset, batch_size=100, shuffle=False, num_workers=2)
+    testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                           download=True, transform=test_transform)
 
-classes = ('plane', 'car', 'bird', 'cat', 'deer',
-           'dog', 'frog', 'horse', 'ship', 'truck')
+    
+    train_transform = transforms.Compose([transforms.ToTensor(),transforms.Normalize((trainset.data.mean(),),(trainset.data.std(),))])
 
-# Model
-print('==> Building model..')
-# net = VGG('VGG19')
-# net = ResNet18()
-# net = PreActResNet18()
-# net = GoogLeNet()
-# net = DenseNet121()
-# net = ResNeXt29_2x64d()
-# net = MobileNet()
-# net = MobileNetV2()
-# net = DPN92()
-# net = ShuffleNetG2()
-# net = SENet18()
-# net = ShuffleNetV2(1)
-# net = EfficientNetB0()
-# net = RegNetX_200MF()
-net = SimpleDLA()
-net = net.to(device)
-if device == 'cuda':
-    net = torch.nn.DataParallel(net)
-    cudnn.benchmark = True
+    test_transform = transforms.Compose([transforms.ToTensor(),transforms.Normalize((testset.data.mean(),),(testset.data.std(),))])
+    
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                            download=True, transform=train_transform)
 
-if args.resume:
-    # Load checkpoint.
-    print('==> Resuming from checkpoint..')
-    assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
-    checkpoint = torch.load('./checkpoint/ckpt.pth')
-    net.load_state_dict(checkpoint['net'])
-    best_acc = checkpoint['acc']
-    start_epoch = checkpoint['epoch']
+    testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                           download=True, transform=test_transform)
+    classes = ('plane', 'car', 'bird', 'cat', 'deer',
+             'dog', 'frog', 'horse', 'ship', 'truck')
+    augmented_trainset = trainset
+    augmented_testset = testset
+    dataloader_args = dict(shuffle=True, batch_size=p_batchsize)
+    train_loader = torch.utils.data.DataLoader(trainset, **dataloader_args)
+    dataloader_args = dict(shuffle=False, batch_size=p_batchsize)
+    test_loader = torch.utils.data.DataLoader(testset, **dataloader_args)
+  else:
+    print('==> Preparing augmented Dataset...')
+    augmented_trainset = Augmentation_TrainDataset(p_orig_train_dataset)
+    augmented_testset = Augmentation_TestDataset(p_orig_test_dataset)
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=args.lr,
-                      momentum=0.9, weight_decay=5e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+    print('==> Preparing Train/Test loaders')
+    dataloader_args = dict(shuffle=True, batch_size=p_batchsize,num_workers=4, pin_memory=True) if cuda else dict (shuffle=True, batch_size=p_batchsize)
+    train_loader = torch.utils.data.DataLoader(augmented_trainset, **dataloader_args)
+    dataloader_args = dict(shuffle=False, batch_size=p_batchsize,num_workers=4, pin_memory=True) if cuda else dict (shuffle=False, batch_size=p_batchsize)
+    test_loader = torch.utils.data.DataLoader(augmented_testset, **dataloader_args)
+  return augmented_trainset, augmented_testset,train_loader, test_loader
 
 
-# Training
-def train(epoch):
-    print('\nEpoch: %d' % epoch)
-    net.train()
-    train_loss = 0
-    correct = 0
-    total = 0
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
-        inputs, targets = inputs.to(device), targets.to(device)
-        optimizer.zero_grad()
-        outputs = net(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
-
-        train_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
-
-        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                     % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+# Initialize model
+def initialize_model(p_lr = 0.01,p_momentum = 0.9):
+  device = 'cuda' if torch.cuda.is_available() else 'cpu'
+  print('==> Initializing Model...')
+  model = ResNet18().to(device)
+  print('==> Model initilaized on ',device)
+  print('==> Initializing Optimizer...')
+  optimizer = optim.SGD(model.parameters(), lr=p_lr, momentum=p_momentum)
+  print('==> SGD optimizer initialized')
+  summary(model, input_size=(3, 32, 32))
+  return model, optimizer, device
 
 
-def test(epoch):
-    global best_acc
-    net.eval()
-    test_loss = 0
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(testloader):
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = net(inputs)
-            loss = criterion(outputs, targets)
+# Train Test Model
+def train_model(model, device, train_loader, optimizer, epoch):
+  from tqdm import tqdm
+  criterion = nn.CrossEntropyLoss()
+  train_losses = []
+  train_acc = []
+  lst = []
+  lambda_l1 = 0.000001
+  pbar = tqdm(train_loader)
+  correct = 0
+  processed = 0
+  lst = []
+  torch.set_grad_enabled(True)
+  model.train()
+  for batch_idx, (data, target) in enumerate(pbar):
+    # get samples
+    
+    data, target = data.to(device), target.to(device)
+    
+    # Init
+    optimizer.zero_grad()
+    y_pred = model(data)
+    loss = criterion(y_pred, target)
+    train_losses.append(loss.item())
+    # Backpropagation
+    loss.backward()
+    
+    optimizer.step()
+    
+    # Update pbar-tqdm
+    pred = y_pred.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+    correct += pred.eq(target.view_as(pred)).sum().item()
+    processed += len(data)
+    
+    pbar.set_description(desc= f'Loss={loss.item()} Batch_id={batch_idx} Accuracy={100*correct/processed:0.2f}')
+    train_acc.append(100*correct/processed)
+    #if (batch_idx >5):
+      #break
+  lst = [train_losses,train_acc]
+  return(lst)
 
-            test_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
+def test_model(model, device, test_loader):
+  criterion = nn.CrossEntropyLoss()
+  test_losses = []
+  test_acc = []
+  lst = []
+  lambda_l1 = 0.000001
+  model.eval()
+  test_loss = 0
+  correct = 0
+  count = 0
+  lst = []
+  with torch.no_grad():
+  #torch.set_grad_enabled(False)
+    for data, target in test_loader:
+      data, target = data.to(device), target.to(device)
+      
+      output = model(data)
+      #F.nll_loss
+      test_loss += criterion(output, target)#, reduction='sum').item()  # sum up batch loss
+      pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+      correct += pred.eq(target.view_as(pred)).sum().item()
+      count += 1
+      #if (count > 5):
+        #break
+      test_loss /= len(test_loader.dataset)
+      test_losses.append(test_loss)
+      test_acc.append(100. * correct / len(test_loader.dataset))
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
+        test_loss, correct, len(test_loader.dataset),
+        100. * correct / len(test_loader.dataset)))
+    
+    lst = [test_losses,test_acc]
+  return(lst)
 
-            progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                         % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
-
-    # Save checkpoint.
-    acc = 100.*correct/total
-    if acc > best_acc:
-        print('Saving..')
-        state = {
-            'net': net.state_dict(),
-            'acc': acc,
-            'epoch': epoch,
-        }
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-        torch.save(state, './checkpoint/ckpt.pth')
-        best_acc = acc
 
 
-for epoch in range(start_epoch, start_epoch+200):
-    train(epoch)
-    test(epoch)
-    scheduler.step()
+# Run Train/Test Epoch Loops
+def run_train_test_epochs(p_epochs = 1, p_batch_size =1, p_model = None, p_optimizer = None, p_device = 'cpu'):
+  train_epoch_lst = []
+  test_epoch_lst = []
+  #model = p_model.to(p_device)
+  for epoch in range(p_epochs):
+    if (epoch == 0):
+      orig_train, orig_test, train_loader , test_loader = prep_data(p_batchsize=p_batch_size, p_download_required='Y')
+    else:
+      print('\n==> Refreshing Dataset for next epoch')
+      temp_a,temp_b, train_loader , test_loader = prep_data(p_batchsize=p_batch_size, p_download_required='N',p_orig_train_dataset = orig_train,p_orig_test_dataset = orig_test)
+      print("==> Train loop for Epoch #:", epoch)
+      train_epoch_lst = train_model(p_model, p_device, train_loader, p_optimizer, p_epochs)
+      print("==> Test loop for Epoch #:", epoch)
+      test_epoch_lst = test_model(p_model, p_device, test_loader)
+    
+  return train_epoch_lst, test_epoch_lst
+
+

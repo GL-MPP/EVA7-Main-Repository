@@ -1,124 +1,171 @@
 '''Some helper functions for PyTorch, including:
     - get_mean_and_std: calculate the mean and std value of dataset.
-    - msr_init: net parameter initialization.
-    - progress_bar: progress bar mimic xlua.progress.
+    - image transforms
+    - gradcam
+    - misclassification code
+    - tensorboard related stuff
+    - advanced training policies
 '''
+
 import os
 import sys
 import time
 import math
-
+import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.init as init
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset
+import albumentations as A
+from albumentations import (pytorch,Normalize,Cutout,Crop)
+import matplotlib.pyplot as plt
 
+class Augmentation_TrainDataset(Dataset):
+    def __init__(self, original_dataset):
+        self.original_dataset = original_dataset
+        self.mean = self.original_dataset.data.mean()
+        self.std = self.original_dataset.data.std()
+        self.max = self.original_dataset.data.max()
+        self.aug = A.Compose({
+        #A.VerticalFlip(p=1),
+        #A.PadIfNeeded(min_height=40, min_width=40, always_apply = True),
+        A.RandomCrop(height = 32, width = 32, always_apply=False, p=1.0),
+        A.Cutout(num_holes=1, max_h_size=16, max_w_size=16, always_apply=False, p=1,fill_value = (.5-self.mean)/self.std)
+        #A.Normalize((self.mean,), (self.std,),self.max),
+        })
+         
+    def __len__(self):
+        return (len(self.original_dataset))
+    
+    def __getitem__(self, i):
+        data_item = self.original_dataset[i]
+        img, lbl = data_item
+        aug_img = self.aug(image=np.transpose(np.array(img), (1, 2, 0)))['image']
+        #aug_img = self.aug(image = img)['image']
+        aug_img = np.transpose(np.array(aug_img), (2,0,1))
+        data_item = (aug_img,lbl)    
+        return data_item
 
-def get_mean_and_std(dataset):
-    '''Compute the mean and std value of dataset.'''
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True, num_workers=2)
-    mean = torch.zeros(3)
-    std = torch.zeros(3)
-    print('==> Computing mean and std..')
-    for inputs, targets in dataloader:
-        for i in range(3):
-            mean[i] += inputs[:,i,:,:].mean()
-            std[i] += inputs[:,i,:,:].std()
-    mean.div_(len(dataset))
-    std.div_(len(dataset))
-    return mean, std
+class Augmentation_TestDataset(Dataset):
+    def __init__(self, original_dataset):
+        self.original_dataset = original_dataset
+        self.mean = self.original_dataset.data.mean()
+        self.std = self.original_dataset.data.std()
+        self.max = self.original_dataset.data.max()
+        self.aug = A.Compose({
+        #A.Normalize((self.mean,), (self.std,),self.max),
+        })
+         
+    def __len__(self):
+        return (len(self.original_dataset))
+    
+    def __getitem__(self, i):
+        data_item = self.original_dataset[i]
+        img, lbl = data_item
+        aug_img = self.aug(image=np.transpose(np.array(img), (1, 2, 0)))['image']
+        aug_img = np.transpose(np.array(aug_img), (2,0,1))
+        data_item = (aug_img,lbl)    
+        return data_item
 
-def init_params(net):
-    '''Init layer parameters.'''
-    for m in net.modules():
-        if isinstance(m, nn.Conv2d):
-            init.kaiming_normal(m.weight, mode='fan_out')
-            if m.bias:
-                init.constant(m.bias, 0)
-        elif isinstance(m, nn.BatchNorm2d):
-            init.constant(m.weight, 1)
-            init.constant(m.bias, 0)
-        elif isinstance(m, nn.Linear):
-            init.normal(m.weight, std=1e-3)
-            if m.bias:
-                init.constant(m.bias, 0)
+def display_graphs(train_lst = [], test_lst = []):
+  print('Loss and Accuracy graphs')
+  fig, axs = plt.subplots(2,2,figsize=(15,10))
+  axs[0, 0].plot(train_lst[0])
+  axs[0, 0].set_title("Training Loss")
+  axs[1, 0].plot(train_lst[1])
+  axs[1, 0].set_title("Training Accuracy")
+  axs[0, 1].plot(test_lst[0])
+  axs[0, 1].set_title("Test Loss")
+  axs[1, 1].plot(test_lst[1])
+  axs[1, 1].set_title("Test Accuracy")
 
+def gen_gradcam(p_img_list = None, p_model = None):
+  img_lst = []
+  gradcam_img = torch.tensor([])
+  cpu_model = p_model.to('cpu')
+  for i in range(len(p_img_list)):
+    pred1 = cpu_model.part_layer1(p_img_list[i].permute(2,0,1).reshape(1,3,32,32))
+    pred2 = cpu_model.part_layer2(pred1)
+    pred3 = cpu_model.linear(pred2.reshape(-1,512))
 
-_, term_width = os.popen('stty size', 'r').read().split()
-term_width = int(term_width)
+    pred3_lbl = pred3.reshape(-1,10).argmax(dim=1).item()
+    ## Generate gradient at layer where image size is > 7x7
+    pred1.retain_grad()
+    # Generate gradient for the wrongly classified image
+    pred3[0,pred3_lbl].backward()
 
-TOTAL_BAR_LENGTH = 65.
-last_time = time.time()
-begin_time = last_time
-def progress_bar(current, total, msg=None):
-    global last_time, begin_time
-    if current == 0:
-        begin_time = time.time()  # Reset for new bar.
+    count = 0
+    #gradcam_img = torch.tensor([])
+    for i in range(len(pred1[0])):
+      x = pred1.grad[0,i].mean()
+      if x>0 :
+        if (count == 0):
+          gradcam_img = pred1[0,i] * x
+          temp_gradcam = pred1[0,i] * x
+        else:
+          temp_gradcam = pred1[0,i] * x
+          gradcam_img += temp_gradcam
+        count += 1
+    gradcam_img = gradcam_img/count
+    temp_img = gradcam_img.data
+    img_lst.append(temp_img)
+    #plt.imshow(gradcam_img.data)
+    #plt.show()
+  if len(gradcam_img) > 0:
+    print('\n Gradcam images for above images as below \n')
+    for i in range(len(img_lst)):
+      plt.subplot(2, 5, i+1)
+      plt.axis('off')
+      plt.imshow(img_lst[i].squeeze())
+  else:
+    print('Gradcam not generated...')
+    #plt.show()
 
-    cur_len = int(TOTAL_BAR_LENGTH*current/total)
-    rest_len = int(TOTAL_BAR_LENGTH - cur_len) - 1
+def find_misclassified_img(p_images = 10, p_model = None, 
+                           p_device = 'cpu', p_test_loader = None,
+                           p_max = 0, p_mean = 0, p_std = 0):
+  print('Misclassified images for Batch Normalization')
+  cpu_model = p_model.to(p_device)
+  img_counter = 0;
+  i = 0;
+  img_lst = []
+  for test_batch in p_test_loader:
+    i += 1
+    print(f'Checking batch # {i}')
+    #test_batch = next(iter(test_loader)) # Get the first batch from the train loader
+    batch_img, batch_lbl = test_batch
+    for j in range(len(batch_img)): # processing sets of images in each batch
+      img, lbl = batch_img.data[j].to(p_device), batch_lbl.data[j].to(p_device)
+      #img, lbl = batch_img.data[j], batch_lbl.data[j]
+      #img, lbl = img.to(device), lbl.to(device)
+      img1 = img*p_std+p_mean
+      test_pred = cpu_model(img.reshape(1,3,32,32)) # passing each test image to the model
+      predicted_label = test_pred.reshape(-1,10).argmax(dim=1).item() # finding the max tensor position to determine the predicted label 
+      if (predicted_label != lbl): # Check to see if the model prediction was correct and print 10 misclassified images
+        img_counter += 1
+        plt.imshow(img1.permute(1,2,0))
+        plt.show()
+        print(f'The model predicted the above image as - {predicted_label}')
+        print(f'Actual label of the above image is - {lbl}')
 
-    sys.stdout.write(' [')
-    for i in range(cur_len):
-        sys.stdout.write('=')
-    sys.stdout.write('>')
-    for i in range(rest_len):
-        sys.stdout.write('.')
-    sys.stdout.write(']')
+        temp_img = img1.permute(1,2,0)
+        img_lst.append(temp_img)
+        #plt.subplot(5, 2, 10)
+        #plt.axis('off')
+        #plt.imshow(img1.numpy().squeeze(), cmap='gray_r')
 
-    cur_time = time.time()
-    step_time = cur_time - last_time
-    last_time = cur_time
-    tot_time = cur_time - begin_time
+        if (img_counter > p_images-1):
+          break
+    if (img_counter > p_images-1):
+      print(f'10 misclassified images found.. Processing stopped')
+      break
+  print ('10 misclassified images as below -  ')
+  for i in range(len(img_lst)):
+    plt.subplot(2, 5, i+1)
+    plt.axis('off')
+    plt.imshow(img_lst[i].squeeze())
+  plt.show()
+  return img_lst
 
-    L = []
-    L.append('  Step: %s' % format_time(step_time))
-    L.append(' | Tot: %s' % format_time(tot_time))
-    if msg:
-        L.append(' | ' + msg)
-
-    msg = ''.join(L)
-    sys.stdout.write(msg)
-    for i in range(term_width-int(TOTAL_BAR_LENGTH)-len(msg)-3):
-        sys.stdout.write(' ')
-
-    # Go back to the center of the bar.
-    for i in range(term_width-int(TOTAL_BAR_LENGTH/2)+2):
-        sys.stdout.write('\b')
-    sys.stdout.write(' %d/%d ' % (current+1, total))
-
-    if current < total-1:
-        sys.stdout.write('\r')
-    else:
-        sys.stdout.write('\n')
-    sys.stdout.flush()
-
-def format_time(seconds):
-    days = int(seconds / 3600/24)
-    seconds = seconds - days*3600*24
-    hours = int(seconds / 3600)
-    seconds = seconds - hours*3600
-    minutes = int(seconds / 60)
-    seconds = seconds - minutes*60
-    secondsf = int(seconds)
-    seconds = seconds - secondsf
-    millis = int(seconds*1000)
-
-    f = ''
-    i = 1
-    if days > 0:
-        f += str(days) + 'D'
-        i += 1
-    if hours > 0 and i <= 2:
-        f += str(hours) + 'h'
-        i += 1
-    if minutes > 0 and i <= 2:
-        f += str(minutes) + 'm'
-        i += 1
-    if secondsf > 0 and i <= 2:
-        f += str(secondsf) + 's'
-        i += 1
-    if millis > 0 and i <= 2:
-        f += str(millis) + 'ms'
-        i += 1
-    if f == '':
-        f = '0ms'
-    return f
